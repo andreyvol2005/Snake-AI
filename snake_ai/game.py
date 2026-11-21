@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import random
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -32,19 +33,26 @@ class GameConfig:
 
     grid: int = GRID_SIZE
     eat_reward: float = 10.0
-    death_penalty: float = -10.0
-    step_penalty: float = -0.005
-    # Поощрение за сокращение манхэттенского расстояния до яблока —
-    # заставляет агента двигаться к еде, а не кружить на месте.
-    distance_shaping: float = 0.3
-    win_reward: float = 100.0
-    # Максимум тиков на партию. Должно хватать, чтобы змейка выросла до 30+
-    # очков: на длинной змейке одному шагу соответствует много тиков.
-    max_steps: int = 2000
-    # Если ядло не съедено за это количество тиков — партия считается
-    # зацикленной и прерывается со штрафом. Это ломает «кружение по кругу»,
-    # из-за которого агент раньше умирал ровно на 30–40 очках.
-    starve_steps: int = 200
+    # Смерть теперь стоит заметно дороже яблока: агенту невыгодно
+    # рисковать длинной змейкой ради одного лишнего очка.
+    death_penalty: float = -40.0
+    # Награда за каждый прожитый шаг. Раньше за шаг был маленький штраф,
+    # из-за чего агенту было всё равно, выживет он или умрёт.
+    survival_bonus: float = 0.1
+    # Поощрение за приближение к яблоку по кратчайшему пути В ОБХОД ТЕЛА
+    # (BFS), а не по прямой. Прямая часто ведёт в собственный хвост.
+    distance_shaping: float = 0.4
+    win_reward: float = 200.0
+    # Максимум тиков на партию. Должно хватать, чтобы змейка выросла до
+    # длинного тела: на длинной змейке одному шагу соответствует много тиков.
+    max_steps: int = 3000
+    # Если яблоко не съедено за это количество тиков — партия считается
+    # зацикленной и прерывается со штрафом.
+    starve_steps: int = 220
+    starve_penalty: float = -10.0
+    # BFS-награда: вести змейку к яблоку по свободному коридору, а не
+    # сквозь собственное тело. Отключается для старых экспериментов.
+    bfs_shaping: bool = True
 
 
 @dataclass
@@ -138,7 +146,7 @@ class SnakeGame:
                 self.steps, self.score, self.steps_since_food,
             )
 
-        old_distance = self._distance()
+        old_distance = self._path_distance()
         self.snake.insert(0, head)
         self.steps += 1
         self.steps_since_food += 1
@@ -153,12 +161,14 @@ class SnakeGame:
                     self.view, self.cfg.win_reward, True, True,
                     self.steps, self.score, self.steps_since_food,
                 )
-            reward = self.cfg.eat_reward
+            reward = self.cfg.eat_reward + self.cfg.survival_bonus
         else:
             self.snake.pop()
-            reward = self.cfg.step_penalty
+            reward = self.cfg.survival_bonus
             if self.cfg.distance_shaping:
-                reward += self.cfg.distance_shaping * (old_distance - self._distance())
+                new_distance = self._path_distance()
+                if old_distance is not None and new_distance is not None:
+                    reward += self.cfg.distance_shaping * (old_distance - new_distance)
 
         # Защита от зацикливания: если долго не ест — прерываем со штрафом.
         # Запас растёт с длиной змейки: длинной змейке нужно больше тиков,
@@ -167,17 +177,59 @@ class SnakeGame:
         starved = self.steps_since_food >= starve_limit
         if starved and not self.done:
             self.done = True
-            reward += -2.0  # дополнительный штраф за зацикливание
+            reward += self.cfg.starve_penalty  # штраф за зацикливание
+
+        # Лимит тиков на партию: не даём одному эпизоду длиться бесконечно.
+        # Это не смерть, поэтому дополнительного штрафа нет.
+        if not self.done and self.steps >= self.cfg.max_steps:
+            self.done = True
 
         return StepResult(
             self.view, reward, self.done, ate, self.steps, self.score, self.steps_since_food,
         )
 
     def _distance(self) -> int:
+        """Манхэттенское расстояние до яблока (используется как запасной вариант)."""
         if self.food is None:
             return 0
         hx, hy = self.snake[0]
         return abs(self.food[0] - hx) + abs(self.food[1] - hy)
+
+    def _path_distance(self) -> Optional[int]:
+        """Длина кратчайшего пути до яблока в обход тела (BFS).
+
+        Хвост не считается препятствием: на следующем тике он уйдёт с клетки.
+        ``None`` — путь полностью перекрыт собственным телом.
+        """
+        if self.food is None:
+            return 0
+        if not self.cfg.bfs_shaping:
+            return self._distance()
+
+        n = self.cfg.grid
+        start = self.snake[0]
+        target = self.food
+        blocked = set(self.snake[:-1])
+        blocked.discard(start)
+
+        queue = deque([(start[0], start[1], 0)])
+        seen = {start}
+        while queue:
+            x, y, dist = queue.popleft()
+            if (x, y) == target:
+                return dist
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < n and 0 <= ny < n):
+                    continue
+                cell = (nx, ny)
+                if cell in seen:
+                    continue
+                if cell in blocked and cell != target:
+                    continue
+                seen.add(cell)
+                queue.append((nx, ny, dist + 1))
+        return None
 
     # ------------------------------------------------------------------ utils
     def danger(self, direction: int) -> bool:

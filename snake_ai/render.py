@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pygame
 
+from .agent import NetworkSnapshot
 from .game import DOWN, LEFT, RIGHT, UP, SnakeGame
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
@@ -61,6 +62,7 @@ class Renderer:
         self.small_font = pygame.font.Font(str(ASSETS / "font.otf"), 24)
         self.tiny_font = pygame.font.Font(str(ASSETS / "font.otf"), 16)
         self.tinier_font = pygame.font.Font(str(ASSETS / "font.otf"), 12)
+        self.micro_font = pygame.font.Font(str(ASSETS / "font.otf"), 10)
 
     # --------------------------------------------------------------- отрисовка игры
     def draw_game(self, game: SnakeGame, score: int, best: int, info: str = "") -> None:
@@ -72,7 +74,7 @@ class Renderer:
         self.screen.blit(record_text, (300, 1))
         self.screen.blit(self.replay, (900, 1))
         if info:
-            self.screen.blit(self.small_font.render(info, True, "white"), (560, 8))
+            self.screen.blit(self.small_font.render(info, True, "white"), (630, 8))
 
         ox, oy = OFFSET
         if game.food is not None:
@@ -87,154 +89,309 @@ class Renderer:
             self.screen.blit(img, (ox + x * CELL, oy + y * CELL))
 
     # ------------------------------------------------------- отрисовка нейросети
-    def draw_network(
-        self,
-        state_vector: np.ndarray,
-        activations: List[np.ndarray],
-        weights: List[Tuple[np.ndarray, np.ndarray]],
-        chosen_action: int,
-    ) -> None:
-        """Чёрная панель справа: нейроны, веса, активность, выбранное действие."""
+    @staticmethod
+    def _bright(vals: np.ndarray, floor: float = 0.06) -> np.ndarray:
+        """Яркость [0,1] по абсолютной величине, нормированная на максимум слоя."""
+        v = np.abs(np.asarray(vals, dtype=np.float32)).ravel()
+        if v.size == 0:
+            return v
+        peak = float(v.max())
+        if peak > 1e-9:
+            v = v / peak
+        return np.clip(floor + (1.0 - floor) * v, 0.0, 1.0)
+
+    @staticmethod
+    def _mix(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+        t = max(0.0, min(1.0, t))
+        return (int(a[0] + (b[0] - a[0]) * t),
+                int(a[1] + (b[1] - a[1]) * t),
+                int(a[2] + (b[2] - a[2]) * t))
+
+    def _draw_input_map(self, snap: NetworkSnapshot, x: int, y: int, cell: int = 5) -> None:
+        board = np.asarray(snap.input_values)
+        if board.ndim != 2:
+            return
+        head = np.asarray(snap.head_map)
+        h, w = board.shape
+        pygame.draw.rect(self.screen, (55, 55, 70), (x - 2, y - 2, w * cell + 3, h * cell + 3), 1)
+        for yy in range(h):
+            for xx in range(w):
+                value = float(board[yy, xx])
+                if head.size and float(head[yy, xx]) > 0.5:
+                    color = (240, 240, 255)
+                elif value > 0.5:
+                    color = (80, 230, 100)
+                elif value < -0.5:
+                    color = (55, 105, 205)
+                else:
+                    color = (18, 18, 26)
+                pygame.draw.rect(self.screen, color, (x + xx * cell, y + yy * cell, cell - 1, cell - 1))
+
+    def _draw_conv_maps(self, acts: np.ndarray, x: int, y: int, scale: int,
+                        label: str, cols: int = 4, count: int = 8) -> None:
+        if acts is None or acts.size == 0:
+            return
+        lbl = self.micro_font.render(label, True, (150, 150, 170))
+        self.screen.blit(lbl, (x, y - 13))
+        gap = 4
+        for k in range(min(count, acts.shape[0])):
+            fmap = np.asarray(acts[k], dtype=np.float32)
+            peak = float(fmap.max())
+            if peak > 1e-9:
+                fmap = fmap / peak
+            gx = x + (k % cols) * (fmap.shape[1] * scale + gap)
+            gy = y + (k // cols) * (fmap.shape[0] * scale + gap)
+            for yy in range(fmap.shape[0]):
+                for xx in range(fmap.shape[1]):
+                    b = float(np.clip(fmap[yy, xx], 0.0, 1.0)) ** 0.65
+                    color = (int(20 + 225 * b), int(25 + 225 * b), int(35 + 220 * b))
+                    pygame.draw.rect(self.screen, color,
+                                     (gx + xx * scale, gy + yy * scale, scale, scale))
+            pygame.draw.rect(self.screen, (70, 70, 95),
+                             (gx - 1, gy - 1, fmap.shape[1] * scale + 1, fmap.shape[0] * scale + 1), 1)
+
+    def _draw_kernels(self, weights: np.ndarray, x: int, y: int, cell: int,
+                      label: str, cols: int = 2, count: int = 8) -> None:
+        if weights is None or weights.size == 0:
+            return
+        lbl = self.micro_font.render(label, True, (150, 150, 170))
+        self.screen.blit(lbl, (x, y - 13))
+        gap = 4
+        for k in range(min(count, weights.shape[0])):
+            kernel = np.asarray(weights[k], dtype=np.float32).mean(axis=0)
+            peak = float(np.abs(kernel).max())
+            gx = x + (k % cols) * (kernel.shape[1] * cell + gap)
+            gy = y + (k // cols) * (kernel.shape[0] * cell + gap)
+            for yy in range(kernel.shape[0]):
+                for xx in range(kernel.shape[1]):
+                    w = float(kernel[yy, xx])
+                    strength = abs(w) / peak if peak > 1e-9 else 0.0
+                    target = WEIGHT_POS if w >= 0 else WEIGHT_NEG
+                    color = self._mix((18, 18, 26), target, 0.15 + 0.85 * strength)
+                    pygame.draw.rect(self.screen, color,
+                                     (gx + xx * cell, gy + yy * cell, cell, cell))
+            pygame.draw.rect(self.screen, (70, 70, 95),
+                             (gx - 1, gy - 1, kernel.shape[1] * cell + 1, kernel.shape[0] * cell + 1), 1)
+
+    def draw_network(self, snap: NetworkSnapshot) -> None:
+        """Чёрная панель справа: карта входа, свёртки, нейроны, веса, сигнал."""
         if not self.show_network:
             return
 
-        panel_x = GAME_W + 20
+        panel_x = GAME_W + 15
 
-        # Заливка панели
         pygame.draw.rect(self.screen, BG_NET, (GAME_W, 0, NET_W, 1000))
-        title = self.tiny_font.render("Нейросеть DQN", True, TEXT_COLOR)
-        self.screen.blit(title, (panel_x, 14))
+        title = self.tiny_font.render("Нейросеть DQN + BFS-щит", True, TEXT_COLOR)
+        self.screen.blit(title, (panel_x, 8))
 
-        # Слои: вход (11), скрытые 1 и 2 (показываем до 16 нейронов каждый), выход (3)
-        input_vals = state_vector
-        hid1 = activations[0] if len(activations) > 0 else np.array([])
-        hid2 = activations[1] if len(activations) > 1 else np.array([])
+        n_hidden = len(snap.hidden_activations)
+        if snap.arch == "cnn":
+            subtitle = f"карта 18×18 · свёртки · {n_hidden} скрытых слоя"
+        else:
+            subtitle = f"{len(np.ravel(snap.input_values))} признаков · {n_hidden} скрытых слоя"
+        self.screen.blit(self.micro_font.render(subtitle, True, (130, 130, 150)), (panel_x, 27))
 
-        layers_vals = [input_vals, hid1, hid2]
-        # Ограничиваем скрытые слои 16 нейронами для читаемости
-        layers_vals = [
-            layers_vals[0],
-            layers_vals[1][:16] if layers_vals[1].size else layers_vals[1],
-            layers_vals[2][:16] if layers_vals[2].size else layers_vals[2],
-        ]
+        # ---------------------------------------------------------- зрение сети
+        if snap.arch == "cnn":
+            self.screen.blit(self.micro_font.render("вход 18×18", True, (150, 150, 170)),
+                             (panel_x, 43))
+            self._draw_input_map(snap, panel_x, 56, cell=6)
 
-        layer_xs = [panel_x + 60, panel_x + 150, panel_x + 240, panel_x + 330]
+            # Легенда карты.
+            legend_items = [
+                ((80, 230, 100), "яблоко"),
+                ((55, 105, 205), "змея"),
+                ((240, 240, 255), "голова"),
+                ((45, 45, 55), "пусто"),
+            ]
+            for i, (color, name) in enumerate(legend_items):
+                ly = 172 + i * 14
+                pygame.draw.rect(self.screen, color, (panel_x, ly, 8, 8))
+                self.screen.blit(self.micro_font.render(name, True, (135, 135, 150)),
+                                 (panel_x + 12, ly - 1))
 
-        layer_sizes = [len(layers_vals[0]), len(layers_vals[1]), len(layers_vals[2]), 3]
+            conv = snap.conv_activations
+            if len(conv) > 0:
+                self._draw_conv_maps(conv[0], panel_x + 120, 56, 2,
+                                     f"св. 1 · {min(8, conv[0].shape[0])}/{conv[0].shape[0]}")
+            if len(conv) > 1:
+                self._draw_conv_maps(conv[1], panel_x + 120, 150, 2,
+                                     f"св. 2 · {min(8, conv[1].shape[0])}/{conv[1].shape[0]}")
+            if len(conv) > 2:
+                self._draw_conv_maps(conv[2], panel_x + 120, 208, 3,
+                                     f"св. 3 · {min(8, conv[2].shape[0])}/{conv[2].shape[0]}")
 
-        # Нормализация активаций для яркости. Скрытые слои нормируем по
-        # максимуму в слое, иначе при малых значениях рисунок почти не виден.
-        def norm(vals: np.ndarray, per_layer: bool = False) -> np.ndarray:
+            kernels = snap.conv_weights
+            if len(kernels) > 0:
+                self._draw_kernels(kernels[0], panel_x + 278, 56, 7, "веса 3×3")
+            if len(kernels) > 1:
+                self._draw_kernels(kernels[1], panel_x + 338, 56, 5, "веса")
+            self.screen.blit(
+                self.micro_font.render("яркость = активация", True, (95, 95, 110)),
+                (panel_x + 230, 246),
+            )
+            pygame.draw.line(self.screen, (45, 45, 58), (panel_x, 262), (panel_x + 425, 262))
+            top, bottom = 290, 895
+        else:
+            top, bottom = 95, 895
+
+        # -------------------------------------------------------- решение сети
+        if snap.arch == "cnn":
+            in_vals = snap.feature_values
+            feature_idx = np.linspace(0, in_vals.size - 1, 16).astype(int) if in_vals.size else np.array([], int)
+            in_vals = in_vals[feature_idx] if in_vals.size else np.zeros(16, np.float32)
+            layer_values = [in_vals]
+        else:
+            feature_idx = None
+            layer_values = [np.asarray(snap.input_values).ravel()]
+
+        shown = 16
+        layer_values += [np.asarray(h).ravel()[:shown] for h in snap.hidden_activations]
+        layer_values.append(np.asarray(snap.output_values).ravel())
+
+        n_cols = len(layer_values)
+        xs = np.linspace(panel_x + 35, panel_x + 360, n_cols).astype(int)
+
+        def coords_for(idx: int) -> List[Tuple[int, int]]:
+            vals = layer_values[idx]
             if vals.size == 0:
-                return vals
-            v = np.tanh(vals)
-            if per_layer:
-                peak = float(np.max(np.abs(v)))
-                if peak > 1e-6:
-                    v = v / peak
-            return (v + 1) / 2  # [0, 1]
-
-        input_bright = norm(input_vals)
-        hid1_bright = norm(hid1, per_layer=True)
-        hid2_bright = norm(hid2, per_layer=True)
-
-        layer_brights = [input_bright, hid1_bright, hid2_bright, np.array([0.5, 0.5, 0.5])]
-
-        # Связи между слоями (веса)
-        w_pairs = weights  # [(w1,b1), (w2,b2), (w3,b3)]
-        # w1: (hid1, input), w2: (hid2, hid1), w3: (out, hid2)
-        connections = [
-            (w_pairs[0][0] if len(w_pairs) > 0 else None, 0, 1),
-            (w_pairs[1][0] if len(w_pairs) > 1 else None, 1, 2),
-            (w_pairs[2][0] if len(w_pairs) > 2 else None, 2, 3),
-        ]
-
-        # Координаты нейронов
-        def layer_coords(layer_idx: int) -> List[Tuple[int, int]]:
-            size = layer_sizes[layer_idx]
-            if size == 0:
                 return []
-            x = layer_xs[layer_idx]
-            total_h = 700
-            start_y = 120
-            step = total_h / max(1, size)
-            return [(x, int(start_y + i * step + step / 2)) for i in range(size)]
+            x = int(xs[idx])
+            if idx == n_cols - 1:  # выход: три оценки по центру
+                mid = (top + bottom) / 2
+                return [(x, int(mid + (i - (len(vals) - 1) / 2) * 110)) for i in range(len(vals))]
+            step = (bottom - top) / len(vals)
+            return [(x, int(top + step / 2 + i * step)) for i in range(len(vals))]
 
-        coords = [layer_coords(i) for i in range(4)]
+        coords = [coords_for(i) for i in range(n_cols)]
 
-        # Рисуем связи (от заднего к переднему, чтобы нейроны были поверх).
-        # Линии кладём на общий прозрачный слой — так не обрезаются наклонные.
+        input_bright = self._bright(layer_values[0])
+        hidden_brights = [self._bright(v) for v in layer_values[1:-1]]
+        out_vals = layer_values[-1]
+        if out_vals.size > 1:
+            span = float(out_vals.max() - out_vals.min())
+            out_bright = (out_vals - out_vals.min()) / span if span > 1e-9 else np.full(out_vals.shape, 0.5)
+            out_bright = 0.15 + 0.85 * out_bright
+        else:
+            out_bright = np.array([0.5])
+        layer_brights = [input_bright, *hidden_brights, out_bright]
+
+        # Матрицы весов для показанных нейронов.
+        mats: List[np.ndarray] = []
+        for k, W in enumerate(snap.dense_weights):
+            if k == 0:
+                if snap.arch == "cnn":
+                    if feature_idx is None or feature_idx.size == 0:
+                        continue
+                    mats.append(W[:shown][:, feature_idx])
+                else:
+                    mats.append(W[:shown, :len(layer_values[0])])
+            elif k == len(snap.dense_weights) - 1:
+                mats.append(W[:, :shown])
+            else:
+                mats.append(W[:shown, :shown])
+
+        # Связи рисуем на прозрачном слое, нейроны — поверх.
         connections_layer = pygame.Surface((NET_W, 1000), pygame.SRCALPHA)
-        for w_mat, li, lj in connections:
-            if w_mat is None:
-                continue
-            src_bright = layer_brights[li]
-            for i, (x1, y1) in enumerate(coords[li]):
+        for k, w_mat in enumerate(mats):
+            if k + 1 >= len(coords):
+                break
+            src_bright = layer_brights[k]
+            for i, (x1, y1) in enumerate(coords[k]):
                 if i >= w_mat.shape[1]:
                     continue
-                # Сигнал от нейрона-источника: его текущая активация.
                 act = float(src_bright[i]) if i < len(src_bright) else 0.5
-                for j, (x2, y2) in enumerate(coords[lj]):
+                for j, (x2, y2) in enumerate(coords[k + 1]):
                     if j >= w_mat.shape[0]:
                         continue
                     w = float(w_mat[j, i])
                     if abs(w) < 0.02:
                         continue
                     color = WEIGHT_POS if w > 0 else WEIGHT_NEG
-                    thickness = max(1, int(4 * abs(w)))
-                    # Чем сильнее активация источника и больше вес,
-                    # тем ярче связь — видно, как сигнал идёт по сети.
-                    alpha = int(30 + 215 * min(1.0, abs(w)) * (0.2 + 0.8 * act))
+                    thickness = max(1, min(4, int(1 + 6 * abs(w))))
+                    alpha = int(25 + 210 * min(1.0, abs(w) * 2.5) * (0.15 + 0.85 * act))
                     pygame.draw.line(
-                        connections_layer,
-                        (*color, alpha),
-                        (x1 - GAME_W, y1),
-                        (x2 - GAME_W, y2),
-                        thickness,
+                        connections_layer, (*color, alpha),
+                        (x1 - GAME_W, y1), (x2 - GAME_W, y2), thickness,
                     )
         self.screen.blit(connections_layer, (GAME_W, 0))
 
-        # Рисуем нейроны
-        for li in range(4):
-            if not coords[li]:
-                continue
+        # Нейроны.
+        for li in range(n_cols):
             brights = layer_brights[li]
+            is_out = li == n_cols - 1
             for j, (x, y) in enumerate(coords[li]):
-                r = 7 if li in (0, 3) else 6
-                # Яркость от активации
+                r = 8 if is_out else (6 if li else 5)
                 b = float(brights[j]) if j < len(brights) else 0.0
-                base = 40 + int(150 * b)
-                color = (base, base, base + 30)
-                if li == 3:
-                    # Выходной слой: подсвечиваем выбранное действие
-                    if j == chosen_action:
-                        color = CHOSEN_COLOR
+                base = 35 + int(160 * b)
+                color: Tuple[int, int, int] = (base, base, min(255, base + 25))
+                allowed = (j >= len(snap.action_mask) or bool(snap.action_mask[j]))
+                if is_out:
+                    if not allowed:
+                        color = (52, 52, 62)
                     else:
-                        color = (base, base, base)
+                        color = CHOSEN_COLOR if j == snap.chosen_action else (base, base, base)
                 pygame.draw.circle(self.screen, NEURON_BG, (x, y), r)
                 pygame.draw.circle(self.screen, color, (x, y), max(1, r - 2))
                 pygame.draw.circle(self.screen, NEURON_BORDER, (x, y), r, 1)
+                if is_out and not allowed:
+                    # Зачёркнутый выход: щит запретил этот ход.
+                    pygame.draw.line(self.screen, (95, 95, 110),
+                                     (x - 4, y - 4), (x + 4, y + 4), 1)
+                    pygame.draw.line(self.screen, (95, 95, 110),
+                                     (x - 4, y + 4), (x + 4, y - 4), 1)
 
-                # Подписи для входных нейронов (первые несколько)
-                if li == 0 and j < 6:
-                    lbl = self.tinier_font.render(f"x{j}", True, (110, 110, 125))
-                    self.screen.blit(lbl, (x - 22, y - 5))
+                if li == 0 and snap.arch == "mlp" and j < 11:
+                    lbl = self.micro_font.render(f"x{j}", True, (105, 105, 120))
+                    self.screen.blit(lbl, (x - 20, y - 5))
 
-        # Подписи слоёв — внизу панели, коротко, в одну строку.
-        short_names = ["вход", "скр. 1", "скр. 2", "выход"]
-        for li, name in enumerate(short_names):
-            if not coords[li]:
+            if is_out:
+                names = ["прямо", "влево", "вправо"]
+                for j, (x, y) in enumerate(coords[li]):
+                    if j >= len(names):
+                        break
+                    chosen = j == snap.chosen_action
+                    allowed = (j >= len(snap.action_mask) or bool(snap.action_mask[j]))
+                    if chosen:
+                        name_color = CHOSEN_COLOR
+                    elif allowed:
+                        name_color = (105, 105, 118)
+                    else:
+                        name_color = (70, 70, 82)
+                    lbl = self.tinier_font.render(names[j], True, name_color)
+                    self.screen.blit(lbl, (x + 12, y - 12))
+                    q = float(layer_values[-1][j]) if j < layer_values[-1].size else 0.0
+                    if chosen:
+                        q_color = CHOSEN_COLOR
+                    elif allowed:
+                        q_color = (85, 85, 98)
+                    else:
+                        q_color = (62, 62, 74)
+                    qlbl = self.micro_font.render(f"Q {q:+.2f}", True, q_color)
+                    self.screen.blit(qlbl, (x + 13, y + 1))
+
+        # Подписи слоёв.
+        if snap.arch == "cnn":
+            names = ["признаки"] + [f"скр. {i + 1}" for i in range(n_hidden)] + ["выход"]
+        else:
+            names = ["вход"] + [f"скр. {i + 1}" for i in range(n_hidden)] + ["выход"]
+        for li, name in enumerate(names):
+            if li >= len(coords) or not coords[li]:
                 continue
-            x = layer_xs[li]
             lbl = self.tinier_font.render(name, True, TEXT_COLOR)
-            self.screen.blit(lbl, (x - lbl.get_width() // 2, 950))
+            self.screen.blit(lbl, (int(xs[li]) - lbl.get_width() // 2, 928))
 
-        # Легенда действий
-        legend = ["прямо", "влево", "вправо"]
-        for j in range(3):
-            x, y = coords[3][j] if coords[3] else (panel_x + 330, 120 + j * 100)
-            lbl = self.tiny_font.render(legend[j], True, CHOSEN_COLOR if j == chosen_action else (100, 100, 110))
-            self.screen.blit(lbl, (x + 12, y - 8))
+        # Легенда весов.
+        pygame.draw.line(self.screen, WEIGHT_POS, (panel_x, 958), (panel_x + 20, 958), 2)
+        self.screen.blit(self.micro_font.render("вес +", True, (140, 140, 155)), (panel_x + 25, 952))
+        pygame.draw.line(self.screen, WEIGHT_NEG, (panel_x + 85, 958), (panel_x + 105, 958), 2)
+        self.screen.blit(self.micro_font.render("вес −", True, (140, 140, 155)), (panel_x + 110, 952))
+        self.screen.blit(self.micro_font.render("яркость связи = сигнал", True, (100, 100, 115)),
+                         (panel_x + 180, 952))
+        self.screen.blit(
+            self.micro_font.render("зачёркнутый выход = ход отсечён щитом", True, (85, 85, 100)),
+            (panel_x, 970),
+        )
 
     # --------------------------------------------------------------- общий вызов
     def draw(
@@ -243,20 +400,11 @@ class Renderer:
         score: int,
         best: int,
         info: str = "",
-        state_vector: Optional[np.ndarray] = None,
-        activations: Optional[List[np.ndarray]] = None,
-        weights: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
-        chosen_action: Optional[int] = None,
+        snapshot: Optional[NetworkSnapshot] = None,
     ) -> None:
         self.draw_game(game, score, best, info)
-        if (
-            self.show_network
-            and state_vector is not None
-            and activations is not None
-            and weights is not None
-            and chosen_action is not None
-        ):
-            self.draw_network(state_vector, activations, weights, chosen_action)
+        if self.show_network and snapshot is not None:
+            self.draw_network(snapshot)
         pygame.display.update()
 
     def close(self) -> None:

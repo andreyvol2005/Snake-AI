@@ -6,6 +6,7 @@
     python play.py --human         # играть самому, клавиши WASD / стрелки
     python play.py --episodes 0    # бесконечная игра до закрытия окна
     python play.py --no-network    # без панели нейросети (узкое окно)
+    python play.py --no-shield     # чистая сеть без BFS-страховки
 """
 
 from __future__ import annotations
@@ -29,8 +30,9 @@ from snake_ai.game import (
     GameConfig,
     SnakeGame,
 )
+from snake_ai.policy import choose_action
 from snake_ai.render import Renderer
-from snake_ai.state import encode, state_size
+from snake_ai.state import encode, state_shape
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -60,7 +62,13 @@ def write_best(value: int) -> None:
 def load_agent(path: Path, kind: str) -> DQNAgent:
     if not path.exists():
         raise SystemExit(f"Модель не найдена: {path}. Сначала запустите train.py")
-    agent = DQNAgent.load(path, state_size(kind))
+    expected = state_shape(kind)
+    agent = DQNAgent.load(path, expected)
+    if tuple(agent.state_shape) != tuple(expected):
+        raise SystemExit(
+            f"Модель {path} обучена на состоянии {agent.state_shape}, "
+            f"а {kind} даёт {expected}. Укажите другой --model или переобучите сеть."
+        )
     agent.epsilon = 0.0  # играем без случайных движений
     return agent
 
@@ -73,8 +81,6 @@ def run_agent(args: argparse.Namespace) -> None:
     clock = pygame.time.Clock()
     games = 0
     total = 0
-    # Веса не меняются во время игры — берём один раз.
-    weights = agent.get_weights() if not args.no_network else None
 
     try:
         while args.episodes == 0 or games < args.episodes:
@@ -82,7 +88,6 @@ def run_agent(args: argparse.Namespace) -> None:
                 break
             game = SnakeGame(cfg, rng=random.Random())
             state = encode(game, args.state)
-            activations = None
             action = KEEP
             done = False
 
@@ -90,11 +95,15 @@ def run_agent(args: argparse.Namespace) -> None:
                 if not renderer.pump():
                     break
 
-                if args.no_network:
-                    action = agent.act(state, greedy=True)
-                else:
-                    action, activations = agent.act_with_activations(state, greedy=True)
-
+                action, mask = choose_action(
+                    agent, game, state, shield=not args.no_shield
+                )
+                # Снимок делаем до хода — панель показывает именно то
+                # состояние, по которому сеть приняла это решение.
+                snapshot = (
+                    None if args.no_network
+                    else agent.snapshot(state, action, action_mask=mask)
+                )
                 result = game.step(action)
                 state = encode(game, args.state)
                 done = result.done
@@ -104,10 +113,7 @@ def run_agent(args: argparse.Namespace) -> None:
 
                 renderer.draw(
                     game, game.score, best, f"шаг {game.steps}",
-                    state_vector=state,
-                    activations=activations,
-                    weights=weights,
-                    chosen_action=action,
+                    snapshot=snapshot,
                 )
                 clock.tick(args.speed)
 
@@ -169,14 +175,20 @@ def run_human(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Игра змейки с ИИ или человеком")
-    p.add_argument("--model", type=Path, default=MODELS / "best_vector.pt")
-    p.add_argument("--state", choices=["vector", "vector24", "grid"], default="vector")
+    p.add_argument("--model", type=Path, default=None,
+                   help="по умолчанию models/best_<state>.pt")
+    p.add_argument("--state", choices=["vector", "vector24", "grid"], default="grid")
     p.add_argument("--speed", type=int, default=30, help="шагов в секунду")
     p.add_argument("--episodes", type=int, default=3, help="0 — играть бесконечно")
-    p.add_argument("--max-steps", type=int, default=2000)
+    p.add_argument("--max-steps", type=int, default=3000)
     p.add_argument("--human", action="store_true", help="играть самому")
     p.add_argument("--no-network", action="store_true", help="не показывать панель нейросети")
-    return p.parse_args()
+    p.add_argument("--no-shield", action="store_true",
+                   help="чистая сеть без BFS-щита (для сравнения)")
+    args = p.parse_args()
+    if args.model is None:
+        args.model = MODELS / f"best_{args.state}.pt"
+    return args
 
 
 if __name__ == "__main__":
