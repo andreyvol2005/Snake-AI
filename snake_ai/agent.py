@@ -6,7 +6,7 @@ import random
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -18,16 +18,16 @@ from .game import ACTIONS, KEEP, TURN_L, TURN_R
 @dataclass
 class AgentConfig:
     state_kind: str = "vector"
-    hidden: int = 256
+    hidden: int = 128          # меньше нейронов — быстрее сходится и легче визуализировать
     lr: float = 1e-3
-    gamma: float = 0.95
-    batch_size: int = 128
-    buffer_size: int = 50_000
-    target_sync: int = 1_000      # как часто копировать веса в целевую сеть
-    learn_start: int = 1_000      # сколько переходов набрать до начала обучения
+    gamma: float = 0.97
+    batch_size: int = 256
+    buffer_size: int = 100_000
+    target_sync: int = 2_000   # реже синхронизация целевой сети — стабильнее
+    learn_start: int = 2_000   # набрать больше опыта перед первым обучением
     epsilon_start: float = 1.0
-    epsilon_min: float = 0.02
-    epsilon_decay: float = 0.9995 # множитель на каждый эпизод
+    epsilon_min: float = 0.05  # выше минимум — агент не перестаёт探роваться слишком рано
+    epsilon_decay: float = 0.9998  # медленнее затухание — дольше ищет стратегию
     seed: int = 0
     device: str = "auto"
 
@@ -43,20 +43,31 @@ def _pick_device(pref: str) -> torch.device:
 
 
 class QNetwork(nn.Module):
-    """Небольшой MLP: состояние -> оценки трёх действий."""
+    """MLP: состояние -> оценки трёх действий. Промежуточные активации доступны для визуализации."""
 
     def __init__(self, in_features: int, hidden: int, n_actions: int = len(ACTIONS)):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, n_actions),
-        )
+        self.fc1 = nn.Linear(in_features, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, n_actions)
+        self.relu = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        return self.fc3(x)
+
+    def forward_with_activations(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Возвращает выход сети и активации после каждого слоя (для визуализации)."""
+        acts: List[torch.Tensor] = []
+        x = self.fc1(x)
+        acts.append(self.relu(x))
+        x = self.fc2(acts[-1])
+        acts.append(self.relu(x))
+        x = self.fc3(acts[-1])
+        return x, acts
 
 
 class DQNAgent:
@@ -84,7 +95,35 @@ class DQNAgent:
         if not greedy and random.random() < self.epsilon:
             return random.choice(ACTIONS)
         x = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        return int(self.online(x).argmax(dim=1).item())
+        q, _ = self.online.forward_with_activations(x)
+        return int(q.argmax(dim=1).item())
+
+    @torch.no_grad()
+    def act_with_activations(
+        self, state: np.ndarray, greedy: bool = False
+    ) -> Tuple[int, List[np.ndarray]]:
+        """То же, что act, но возвращает активации слоёв для визуализации."""
+        x = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if not greedy and random.random() < self.epsilon:
+            action = random.choice(ACTIONS)
+            q = torch.zeros(1, len(ACTIONS), device=self.device)
+        else:
+            q, _ = self.online.forward_with_activations(x)
+            action = int(q.argmax(dim=1).item())
+
+        # Пересчитываем активации без градиента для отображения.
+        _, acts = self.online.forward_with_activations(x)
+        activations = [a.detach().cpu().numpy().ravel() for a in acts]
+        return action, activations
+
+    def get_weights(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Возвращает (веса, смещения) каждого линейного слоя для визуализации связей."""
+        pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+        for layer in (self.online.fc1, self.online.fc2, self.online.fc3):
+            pairs.append(
+                (layer.weight.detach().cpu().numpy(), layer.bias.detach().cpu().numpy())
+            )
+        return pairs
 
     # -------------------------------------------------------------- обучение
     def remember(self, state, action, reward, next_state, done) -> None:
@@ -106,9 +145,10 @@ class DQNAgent:
 
         # Double DQN: действие выбирает онлайн-сеть, оценку даёт целевая.
         with torch.no_grad():
-            next_actions = self.online(next_states).argmax(dim=1, keepdim=True)
-            next_q = self.target(next_states).gather(1, next_actions)
-            targets = rewards + self.cfg.gamma * next_q * (1.0 - dones)
+            next_q_online = self.online(next_states)
+            next_actions = next_q_online.argmax(dim=1, keepdim=True)
+            next_q_target = self.target(next_states).gather(1, next_actions)
+            targets = rewards + self.cfg.gamma * next_q_target * (1.0 - dones)
 
         q_values = self.online(states).gather(1, actions)
         loss = nn.functional.smooth_l1_loss(q_values, targets)
@@ -141,7 +181,9 @@ class DQNAgent:
     @classmethod
     def load(cls, path: str | Path, state_size: int) -> "DQNAgent":
         ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
-        cfg = AgentConfig(**ckpt["cfg"])
+        # Отбрасываем лишние ключи, если чекпоинт сохранён другой версией.
+        fields = set(AgentConfig.__dataclass_fields__)
+        cfg = AgentConfig(**{k: v for k, v in ckpt["cfg"].items() if k in fields})
         agent = cls(state_size, cfg)
         agent.online.load_state_dict(ckpt["state_dict"])
         agent.target.load_state_dict(ckpt["state_dict"])

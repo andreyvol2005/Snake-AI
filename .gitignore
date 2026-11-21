@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 models/*.pt
-training_history.csv
+training_history_*.csv
 training_*.png
 record
 .DS_Store

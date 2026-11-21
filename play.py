@@ -5,6 +5,7 @@
     python play.py --model models/best_vector.pt --speed 40
     python play.py --human         # играть самому, клавиши WASD / стрелки
     python play.py --episodes 0    # бесконечная игра до закрытия окна
+    python play.py --no-network    # без панели нейросети (узкое окно)
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import argparse
 import random
 from pathlib import Path
 
+import numpy as np
 import pygame
 
 from snake_ai.agent import DQNAgent
@@ -66,11 +68,13 @@ def load_agent(path: Path, kind: str) -> DQNAgent:
 def run_agent(args: argparse.Namespace) -> None:
     cfg = GameConfig(max_steps=args.max_steps)
     agent = load_agent(args.model, args.state)
-    renderer = Renderer()
+    renderer = Renderer(show_network=not args.no_network)
     best = read_best()
     clock = pygame.time.Clock()
     games = 0
     total = 0
+    # Веса не меняются во время игры — берём один раз.
+    weights = agent.get_weights() if not args.no_network else None
 
     try:
         while args.episodes == 0 or games < args.episodes:
@@ -78,19 +82,33 @@ def run_agent(args: argparse.Namespace) -> None:
                 break
             game = SnakeGame(cfg, rng=random.Random())
             state = encode(game, args.state)
+            activations = None
+            action = KEEP
             done = False
+
             while not done:
                 if not renderer.pump():
                     break
-                action = agent.act(state, greedy=True)
+
+                if args.no_network:
+                    action = agent.act(state, greedy=True)
+                else:
+                    action, activations = agent.act_with_activations(state, greedy=True)
+
                 result = game.step(action)
                 state = encode(game, args.state)
-                done = result.done or game.steps >= args.max_steps
+                done = result.done
                 if game.score > best:
                     best = game.score
                     write_best(best)
-                info = f"шаг {game.steps}"
-                renderer.draw(game, game.score, best, info)
+
+                renderer.draw(
+                    game, game.score, best, f"шаг {game.steps}",
+                    state_vector=state,
+                    activations=activations,
+                    weights=weights,
+                    chosen_action=action,
+                )
                 clock.tick(args.speed)
 
             games += 1
@@ -104,7 +122,7 @@ def run_agent(args: argparse.Namespace) -> None:
 
 def run_human(args: argparse.Namespace) -> None:
     cfg = GameConfig(max_steps=args.max_steps)
-    renderer = Renderer()
+    renderer = Renderer(show_network=False)
     best = read_best()
     clock = pygame.time.Clock()
 
@@ -135,7 +153,7 @@ def run_human(args: argparse.Namespace) -> None:
                         apply_key(event.key)
 
                 result = game.step(KEEP)
-                done = result.done or game.steps >= args.max_steps
+                done = result.done
                 if game.score > best:
                     best = game.score
                     write_best(best)
@@ -152,11 +170,12 @@ def run_human(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Игра змейки с ИИ или человеком")
     p.add_argument("--model", type=Path, default=MODELS / "best_vector.pt")
-    p.add_argument("--state", choices=["vector", "grid"], default="vector")
+    p.add_argument("--state", choices=["vector", "vector24", "grid"], default="vector")
     p.add_argument("--speed", type=int, default=30, help="шагов в секунду")
     p.add_argument("--episodes", type=int, default=3, help="0 — играть бесконечно")
-    p.add_argument("--max-steps", type=int, default=400)
+    p.add_argument("--max-steps", type=int, default=2000)
     p.add_argument("--human", action="store_true", help="играть самому")
+    p.add_argument("--no-network", action="store_true", help="не показывать панель нейросети")
     return p.parse_args()
 
 
