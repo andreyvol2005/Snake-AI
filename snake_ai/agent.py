@@ -217,7 +217,6 @@ class NetworkSnapshot:
     feature_values: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
     dense_weights: List[np.ndarray] = field(default_factory=list)
     conv_activations: List[np.ndarray] = field(default_factory=list)
-    conv_weights: List[np.ndarray] = field(default_factory=list)
 
 
 class DQNAgent:
@@ -332,11 +331,6 @@ class DQNAgent:
                 feature_values=flat.detach().cpu().numpy(),
                 dense_weights=[fc.weight.detach().cpu().numpy() for fc in net.fcs],
                 conv_activations=[a[0].detach().cpu().numpy() for a in conv_acts],
-                conv_weights=[
-                    net.conv1.weight.detach().cpu().numpy(),
-                    net.conv2.weight.detach().cpu().numpy(),
-                    net.conv3.weight.detach().cpu().numpy(),
-                ],
             )
 
         q, acts = net.forward_with_activations(x)

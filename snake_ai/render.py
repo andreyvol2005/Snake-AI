@@ -31,8 +31,8 @@ BG_NET = (12, 12, 18)
 NEURON_BG = (40, 40, 55)
 NEURON_BORDER = (180, 180, 200)
 ACT_COLOR = (0, 255, 120)      # активность нейрона (зелёный)
-WEIGHT_POS = (255, 80, 80)     # положительный вес (красный)
-WEIGHT_NEG = (80, 140, 255)    # отрицательный вес (синий)
+WEIGHT_POS = (80, 140, 255)    # положительный вес (синий)
+WEIGHT_NEG = (255, 80, 80)     # отрицательный вес (красный)
 CHOSEN_COLOR = (255, 220, 60)  # выбранное действие (жёлтый)
 TEXT_COLOR = (220, 220, 230)
 
@@ -128,19 +128,26 @@ class Renderer:
                 pygame.draw.rect(self.screen, color, (x + xx * cell, y + yy * cell, cell - 1, cell - 1))
 
     def _draw_conv_maps(self, acts: np.ndarray, x: int, y: int, scale: int,
-                        label: str, cols: int = 4, count: int = 8) -> None:
+                        label: str, cols: int = 8, count: int = 16) -> None:
+        """Карты активаций одной свёртки.
+
+        Размер карт задаётся явно: у первой свёртки они большие (18×18),
+        у второй и третьей — мелкие, чтобы все 32 фильтра поместились.
+        """
         if acts is None or acts.size == 0:
             return
         lbl = self.micro_font.render(label, True, (150, 150, 170))
         self.screen.blit(lbl, (x, y - 13))
-        gap = 4
-        for k in range(min(count, acts.shape[0])):
+        gap = 3
+        n_maps = min(count, int(acts.shape[0]))
+        size = int(np.asarray(acts[0]).shape[0])
+        for k in range(n_maps):
             fmap = np.asarray(acts[k], dtype=np.float32)
             peak = float(fmap.max())
             if peak > 1e-9:
                 fmap = fmap / peak
-            gx = x + (k % cols) * (fmap.shape[1] * scale + gap)
-            gy = y + (k // cols) * (fmap.shape[0] * scale + gap)
+            gx = x + (k % cols) * (size * scale + gap)
+            gy = y + (k // cols) * (size * scale + gap)
             for yy in range(fmap.shape[0]):
                 for xx in range(fmap.shape[1]):
                     b = float(np.clip(fmap[yy, xx], 0.0, 1.0)) ** 0.65
@@ -148,30 +155,7 @@ class Renderer:
                     pygame.draw.rect(self.screen, color,
                                      (gx + xx * scale, gy + yy * scale, scale, scale))
             pygame.draw.rect(self.screen, (70, 70, 95),
-                             (gx - 1, gy - 1, fmap.shape[1] * scale + 1, fmap.shape[0] * scale + 1), 1)
-
-    def _draw_kernels(self, weights: np.ndarray, x: int, y: int, cell: int,
-                      label: str, cols: int = 2, count: int = 8) -> None:
-        if weights is None or weights.size == 0:
-            return
-        lbl = self.micro_font.render(label, True, (150, 150, 170))
-        self.screen.blit(lbl, (x, y - 13))
-        gap = 4
-        for k in range(min(count, weights.shape[0])):
-            kernel = np.asarray(weights[k], dtype=np.float32).mean(axis=0)
-            peak = float(np.abs(kernel).max())
-            gx = x + (k % cols) * (kernel.shape[1] * cell + gap)
-            gy = y + (k // cols) * (kernel.shape[0] * cell + gap)
-            for yy in range(kernel.shape[0]):
-                for xx in range(kernel.shape[1]):
-                    w = float(kernel[yy, xx])
-                    strength = abs(w) / peak if peak > 1e-9 else 0.0
-                    target = WEIGHT_POS if w >= 0 else WEIGHT_NEG
-                    color = self._mix((18, 18, 26), target, 0.15 + 0.85 * strength)
-                    pygame.draw.rect(self.screen, color,
-                                     (gx + xx * cell, gy + yy * cell, cell, cell))
-            pygame.draw.rect(self.screen, (70, 70, 95),
-                             (gx - 1, gy - 1, kernel.shape[1] * cell + 1, kernel.shape[0] * cell + 1), 1)
+                             (gx - 1, gy - 1, size * scale + 1, size * scale + 1), 1)
 
     def draw_network(self, snap: NetworkSnapshot) -> None:
         """Чёрная панель справа: карта входа, свёртки, нейроны, веса, сигнал."""
@@ -212,26 +196,29 @@ class Renderer:
 
             conv = snap.conv_activations
             if len(conv) > 0:
-                self._draw_conv_maps(conv[0], panel_x + 120, 56, 2,
-                                     f"св. 1 · {min(8, conv[0].shape[0])}/{conv[0].shape[0]}")
+                self._draw_conv_maps(
+                    conv[0], panel_x, 56, 2,
+                    f"свёртка 1 · {min(16, conv[0].shape[0])}/{conv[0].shape[0]}",
+                    cols=8, count=16,
+                )
             if len(conv) > 1:
-                self._draw_conv_maps(conv[1], panel_x + 120, 150, 2,
-                                     f"св. 2 · {min(8, conv[1].shape[0])}/{conv[1].shape[0]}")
+                self._draw_conv_maps(
+                    conv[1], panel_x, 162, 3,
+                    f"свёртка 2 · {min(32, conv[1].shape[0])}/{conv[1].shape[0]}",
+                    cols=16, count=32,
+                )
             if len(conv) > 2:
-                self._draw_conv_maps(conv[2], panel_x + 120, 208, 3,
-                                     f"св. 3 · {min(8, conv[2].shape[0])}/{conv[2].shape[0]}")
-
-            kernels = snap.conv_weights
-            if len(kernels) > 0:
-                self._draw_kernels(kernels[0], panel_x + 278, 56, 7, "веса 3×3")
-            if len(kernels) > 1:
-                self._draw_kernels(kernels[1], panel_x + 338, 56, 5, "веса")
+                self._draw_conv_maps(
+                    conv[2], panel_x, 270, 3,
+                    f"свёртка 3 · {min(32, conv[2].shape[0])}/{conv[2].shape[0]}",
+                    cols=16, count=32,
+                )
             self.screen.blit(
-                self.micro_font.render("яркость = активация", True, (95, 95, 110)),
-                (panel_x + 230, 246),
+                self.micro_font.render("яркость карты = активация фильтра", True, (95, 95, 110)),
+                (panel_x, 340),
             )
-            pygame.draw.line(self.screen, (45, 45, 58), (panel_x, 262), (panel_x + 425, 262))
-            top, bottom = 290, 895
+            pygame.draw.line(self.screen, (45, 45, 58), (panel_x, 356), (panel_x + 425, 356))
+            top, bottom = 382, 895
         else:
             top, bottom = 95, 895
 
