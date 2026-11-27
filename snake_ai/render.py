@@ -1,7 +1,7 @@
-"""Отрисовка игры в окне pygame на ассетах из оригинальной «Змейки» + панель нейросети справа.
+"""Отрисовка игры в окне pygame и панели нейросети справа.
 
-Один экран 1500×1000: слева поле 18×18 по 50 px (как в оригинале), справа —
-чёрная панель с визуализацией DQN: нейроны, связи (веса) и прохождение сигналов.
+Один экран 1500×1000: слева поле 18×18 по 50 px, справа —
+чёрная панель с нейронами, связями (весами) и прохождением сигналов.
 """
 
 from __future__ import annotations
@@ -107,90 +107,8 @@ class Renderer:
                 int(a[1] + (b[1] - a[1]) * t),
                 int(a[2] + (b[2] - a[2]) * t))
 
-    def _draw_input_map(self, snap: NetworkSnapshot, x: int, y: int, cell: int = 5) -> None:
-        board = np.asarray(snap.input_values)
-        if board.ndim != 2:
-            return
-        head = np.asarray(snap.head_map)
-        h, w = board.shape
-        pygame.draw.rect(self.screen, (55, 55, 70), (x - 2, y - 2, w * cell + 3, h * cell + 3), 1)
-        for yy in range(h):
-            for xx in range(w):
-                value = float(board[yy, xx])
-                if head.size and float(head[yy, xx]) > 0.5:
-                    color = (240, 240, 255)
-                elif value > 0.5:
-                    color = (80, 230, 100)
-                elif value < -0.5:
-                    color = (55, 105, 205)
-                else:
-                    color = (18, 18, 26)
-                pygame.draw.rect(self.screen, color, (x + xx * cell, y + yy * cell, cell - 1, cell - 1))
-
-    def _draw_conv_maps(self, acts: np.ndarray, x: int, y: int, scale: int,
-                        label: str, cols: int = 8, count: int = 16) -> None:
-        """Карты активаций одной свёртки (яркость = активация фильтра)."""
-        if acts is None or acts.size == 0:
-            return
-        lbl = self.micro_font.render(label, True, (150, 150, 170))
-        self.screen.blit(lbl, (x, y - 13))
-        gap = 3
-        n_maps = min(count, int(acts.shape[0]))
-        size = int(np.asarray(acts[0]).shape[0])
-        for k in range(n_maps):
-            fmap = np.asarray(acts[k], dtype=np.float32)
-            peak = float(fmap.max())
-            if peak > 1e-9:
-                fmap = fmap / peak
-            gx = x + (k % cols) * (size * scale + gap)
-            gy = y + (k // cols) * (size * scale + gap)
-            for yy in range(fmap.shape[0]):
-                for xx in range(fmap.shape[1]):
-                    b = float(np.clip(fmap[yy, xx], 0.0, 1.0)) ** 0.65
-                    color = (int(20 + 225 * b), int(25 + 225 * b), int(35 + 220 * b))
-                    pygame.draw.rect(self.screen, color,
-                                     (gx + xx * scale, gy + yy * scale, scale, scale))
-            pygame.draw.rect(self.screen, (70, 70, 95),
-                             (gx - 1, gy - 1, size * scale + 1, size * scale + 1), 1)
-
-    @staticmethod
-    def _downsample(fmap: np.ndarray, size: int) -> np.ndarray:
-        """Усреднить карту до size×size — для компактного показа фильтров."""
-        h, w = fmap.shape
-        if h == size and w == size:
-            return fmap
-        rows = (np.arange(size) * h) // size
-        cols = (np.arange(size) * w) // size
-        return fmap[np.ix_(rows, cols)]
-
-    def _draw_conv_grid(self, acts: np.ndarray, x: int, y: int, cell: int,
-                        label: str, cols: int = 8, count: int = 16,
-                        size: int = 18) -> None:
-        """Сетка карт свёртки, при необходимости уменьшенных до size×size."""
-        if acts is None or acts.size == 0:
-            return
-        lbl = self.micro_font.render(label, True, (150, 150, 170))
-        self.screen.blit(lbl, (x, y - 13))
-        gap = 3
-        n_maps = min(count, int(acts.shape[0]))
-        for k in range(n_maps):
-            fmap = self._downsample(np.asarray(acts[k], dtype=np.float32), size)
-            peak = float(fmap.max())
-            if peak > 1e-9:
-                fmap = fmap / peak
-            gx = x + (k % cols) * (size * cell + gap)
-            gy = y + (k // cols) * (size * cell + gap)
-            for yy in range(fmap.shape[0]):
-                for xx in range(fmap.shape[1]):
-                    b = float(np.clip(fmap[yy, xx], 0.0, 1.0)) ** 0.65
-                    color = (int(20 + 225 * b), int(25 + 225 * b), int(35 + 220 * b))
-                    pygame.draw.rect(self.screen, color,
-                                     (gx + xx * cell, gy + yy * cell, cell, cell))
-            pygame.draw.rect(self.screen, (70, 70, 95),
-                             (gx - 1, gy - 1, size * cell + 1, size * cell + 1), 1)
-
     def draw_network(self, snap: NetworkSnapshot) -> None:
-        """Чёрная панель справа: карта входа, свёртки, нейроны, веса, сигнал."""
+        """Чёрная панель справа: нейроны, веса и прохождение сигнала."""
         if not self.show_network:
             return
 
@@ -202,45 +120,13 @@ class Renderer:
 
         n_hidden = len(snap.hidden_activations)
         if snap.arch == "cnn":
-            subtitle = f"карта 18×18 · свёртки · {n_hidden} скрытых слоя"
+            subtitle = f"карта 18×18 · {n_hidden} скрытых слоя"
         else:
             subtitle = f"{len(np.ravel(snap.input_values))} признаков · {n_hidden} скрытых слоя"
         self.screen.blit(self.micro_font.render(subtitle, True, (130, 130, 150)), (panel_x, 27))
 
-        # ---------------------------------------------------------- зрение сети
-        if snap.arch == "cnn":
-            # Компактная карта входа: сама схема поля, без цветной легенды.
-            self.screen.blit(self.micro_font.render("вход 18×18", True, (150, 150, 170)),
-                             (panel_x, 43))
-            self._draw_input_map(snap, panel_x, 56, cell=3)
-
-            conv = snap.conv_activations
-            if len(conv) > 0:
-                self._draw_conv_maps(
-                    conv[0], panel_x + 62, 56, 2,
-                    f"свёртка 1 · {min(16, conv[0].shape[0])}/{conv[0].shape[0]}",
-                    cols=8, count=16,
-                )
-            if len(conv) > 1:
-                self._draw_conv_grid(
-                    conv[1], panel_x, 134, 2,
-                    f"свёртка 2 · {min(32, conv[1].shape[0])}/{conv[1].shape[0]}",
-                    cols=16, count=32, size=9,
-                )
-            if len(conv) > 2:
-                self._draw_conv_grid(
-                    conv[2], panel_x, 214, 4,
-                    f"свёртка 3 · {min(32, conv[2].shape[0])}/{conv[2].shape[0]}",
-                    cols=8, count=32, size=5,
-                )
-            self.screen.blit(
-                self.micro_font.render("яркость карты = активация фильтра", True, (95, 95, 110)),
-                (panel_x, 312),
-            )
-            pygame.draw.line(self.screen, (45, 45, 58), (panel_x, 328), (panel_x + 425, 328))
-            top, bottom = 354, 895
-        else:
-            top, bottom = 95, 895
+        # Нейронная сеть занимает всю доступную высоту панели.
+        top, bottom = 95, 895
 
         # -------------------------------------------------------- решение сети
         if snap.arch == "cnn":
